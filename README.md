@@ -1,5 +1,7 @@
 # vg-model-router (Vivgrid Model Router)
 
+[中文文档](README.CN.md)
+
 A local LLM API proxy for [Codex](https://github.com/openai/codex).
 
 It exposes the OpenAI **Responses API** (`POST /v1/responses`) on your machine and passes each request through unchanged to `https://api.vivgrid.com/v1/responses`, in both streaming and non-streaming mode. The only change to the response is the model ID: every `model` Codex gets back has a `viv-` prefix (see [Model ID prefix](#model-id-prefix)).
