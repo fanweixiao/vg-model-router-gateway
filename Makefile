@@ -1,6 +1,6 @@
 # macOS Apple Silicon 的 release 构建（README: Building a release binary for macOS）
 TARGET := aarch64-apple-darwin
-BIN    := target/$(TARGET)/release/vg-mirror
+BIN    := target/$(TARGET)/release/vg-model-router
 PREFIX ?= $(HOME)/.local/bin
 
 .PHONY: release install clean

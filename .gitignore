@@ -1,3 +1,6 @@
 /target
-/vg-mirror.toml
+/vg-model-router.toml
 *.jsonl
+/.env
+/.env.local
+/.env.*.local

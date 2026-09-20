@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub const DEFAULT_CONFIG: &str = "vg-mirror.toml";
+pub const DEFAULT_CONFIG: &str = "vg-model-router.toml";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -67,7 +67,7 @@ fn default_cheap_threshold() -> f64 {
     0.75
 }
 fn default_classifier_url() -> String {
-    "https://api.typesafe.ai/v1/systemone".into()
+    "https://api.vivgrid.com/v1/systemone".into()
 }
 fn default_classifier_model() -> String {
     "jev-latest".into()
@@ -76,11 +76,11 @@ fn default_timeout_ms() -> u64 {
     5_000
 }
 fn default_log_path() -> Option<PathBuf> {
-    Some("vg-mirror-router.jsonl".into())
+    Some("vg-model-router.jsonl".into())
 }
 
 impl Config {
-    // 显式指定的路径必须存在；默认路径（./vg-mirror.toml）不存在时用默认配置
+    // 显式指定的路径必须存在；默认路径（./vg-model-router.toml）不存在时用默认配置
     pub fn load(path: Option<&Path>) -> Result<(Self, Option<PathBuf>), String> {
         let (path, explicit) = match path {
             Some(p) => (p.to_path_buf(), true),

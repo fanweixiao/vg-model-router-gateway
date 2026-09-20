@@ -1,10 +1,11 @@
 [package]
-name = "vg-mirror"
+name = "vg-model-router"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 axum = "0.8"
+dotenvy = "0.15.7"
 futures-util = "0.3.34"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls", "http2"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -14,4 +15,3 @@ tokio-stream = "0.1.19"
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = { version = "1.26.1", features = ["v4"] }

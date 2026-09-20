@@ -1,7 +1,8 @@
 //! 训练数据日志（mode = "model-router" 时）：每个请求一行 JSONL，记录路由决策、
-//! 发给上游的完整 Chat 请求和模型的完整输出；再用 `vg-mirror export` 导出成 LoRA 微调数据：
+//! 发给上游的 Responses 请求（instructions / input / tools）和模型的完整输出（response 对象）；再用 `vg-model-router export` 导出成 LoRA 微调数据：
 //!   - router：分类文本 → 分类结果，用来训练自己的路由模型
-//!   - sft：   完整对话 → 模型输出，用来把 frontier 模型蒸馏到小模型
+//!   - sft：   完整对话 → 模型输出（转成 Chat 格式），用来把 frontier 模型蒸馏到小模型
+//!
 //! （README: Model Router → Training data）
 
 use std::fs::{File, OpenOptions};
@@ -13,6 +14,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::convert;
 use crate::router::{Decision, Source};
 
 pub struct TrainLog {
@@ -51,7 +53,7 @@ pub struct Pending {
 }
 
 impl Pending {
-    pub fn new(log: Arc<TrainLog>, req_id: u64, requested_model: &str, decision: &Decision, chat_body: &Value) -> Self {
+    pub fn new(log: Arc<TrainLog>, req_id: u64, requested_model: &str, decision: &Decision, req: &Value) -> Self {
         let (source, classifier) = match &decision.source {
             Source::Classified(v) => (
                 json!({ "type": "classified" }),
@@ -76,8 +78,9 @@ impl Pending {
             "route": source,
             "classifier": classifier,
             "request": {
-                "messages": chat_body.get("messages").cloned().unwrap_or(json!([])),
-                "tools": chat_body.get("tools").cloned().unwrap_or(json!([])),
+                "instructions": req.get("instructions").cloned().unwrap_or(Value::Null),
+                "input": req.get("input").cloned().unwrap_or(json!([])),
+                "tools": req.get("tools").cloned().unwrap_or(json!([])),
             },
         });
         Self {
@@ -87,30 +90,21 @@ impl Pending {
         }
     }
 
-    // message：Chat 格式的 assistant 消息；error：上游报错 / 流中断时的错误信息
-    pub fn finish(mut self, model: &str, message: Value, finish_reason: Option<&str>, usage: Option<&Value>, error: Option<&str>) {
+    // resp：上游最终的 response 对象（未加 viv- 前缀）；error：上游报错 / 流中断时的错误信息
+    pub fn finish(mut self, model: &str, resp: Option<&Value>, error: Option<&str>) {
+        let get = |k: &str| resp.and_then(|r| r.get(k)).cloned().unwrap_or(Value::Null);
+        let model = resp.and_then(|r| r.get("model")).and_then(Value::as_str).unwrap_or(model);
         self.record["response"] = json!({
             "model": model,
-            "message": message,
-            "finish_reason": finish_reason,
-            "usage": usage,
-            "error": error,
+            "status": get("status"),
+            "output": resp.and_then(|r| r.get("output")).cloned().unwrap_or(json!([])),
+            "incomplete_details": get("incomplete_details"),
+            "usage": get("usage"),
+            "error": error.map(Value::from).unwrap_or_else(|| get("error")),
         });
         self.record["latency_ms"] = json!(self.started.elapsed().as_millis() as u64);
         self.log.append(&self.record);
     }
-}
-
-// Chat 格式的 assistant 消息（非流式直接用 choices[0].message，流式由 stream.rs 拼出来）
-pub fn assistant_message(content: Option<String>, reasoning: Option<String>, tool_calls: Vec<Value>) -> Value {
-    let mut m = json!({ "role": "assistant", "content": content });
-    if let Some(r) = reasoning {
-        m["reasoning_content"] = json!(r);
-    }
-    if !tool_calls.is_empty() {
-        m["tool_calls"] = Value::Array(tool_calls);
-    }
-    m
 }
 
 fn now_millis() -> u64 {
@@ -121,16 +115,16 @@ fn now_millis() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// 导出：vg-mirror export <router|sft> --in <log.jsonl> --out <data.jsonl> [...]
+// 导出：vg-model-router export <router|sft> --in <log.jsonl> --out <data.jsonl> [...]
 // ---------------------------------------------------------------------------
 
 pub const EXPORT_USAGE: &str = "\
-usage: vg-mirror export router --in <log.jsonl> --out <data.jsonl>
-       vg-mirror export sft    --in <log.jsonl> --out <data.jsonl> [--tier frontier|medium|small|all] [--with-reasoning]
+usage: vg-model-router export router --in <log.jsonl> --out <data.jsonl>
+       vg-model-router export sft    --in <log.jsonl> --out <data.jsonl> [--tier frontier|medium|small|all] [--with-reasoning]
 
   router  one sample per classified request: classifier input → classifier answer
-  sft     one sample per successful request: chat messages + tools → model output
-          (--tier defaults to frontier; reasoning_content is dropped unless --with-reasoning)";
+  sft     one sample per completed request, in Chat format: messages + tools → model output
+          (--tier defaults to frontier; reasoning is dropped unless --with-reasoning)";
 
 const ROUTER_SYSTEM: &str = "Classify the difficulty of the AI request for model routing. \
 Reply with JSON: {\"difficulty_level\": \"cheap\"|\"medium\"|\"expensive\", \
@@ -199,27 +193,28 @@ fn router_sample(rec: &Value) -> Option<Value> {
     }))
 }
 
-// 只导出正常结束（stop / tool_calls）、没有报错、档位匹配的记录：{messages: 请求 + 输出, tools}
+// 只导出 status = completed、没有报错、有输出、档位匹配的记录，转成 Chat 格式：{messages: 请求 + 输出, tools}
 fn sft_sample(rec: &Value, tier: &str, with_reasoning: bool) -> Option<Value> {
     if tier != "all" && rec.get("tier")?.as_str()? != tier {
         return None;
     }
     let resp = rec.get("response")?;
-    if !resp.get("error").is_none_or(Value::is_null) {
+    if !resp.get("error").is_none_or(Value::is_null) || resp.get("status")?.as_str()? != "completed" {
         return None;
     }
-    if !matches!(resp.get("finish_reason")?.as_str()?, "stop" | "tool_calls") {
-        return None;
-    }
-    let mut answer = resp.get("message")?.clone();
-    if !with_reasoning && let Some(o) = answer.as_object_mut() {
-        o.remove("reasoning_content");
-    }
-    let mut messages = rec.pointer("/request/messages")?.as_array()?.clone();
-    messages.push(answer);
-    let mut sample = json!({ "messages": messages });
-    if let Some(tools) = rec.pointer("/request/tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())) {
-        sample["tools"] = tools.clone();
+    let output = resp.get("output")?.as_array().filter(|o| !o.is_empty())?;
+    let req = rec.get("request")?;
+    let mut items = match req.get("input")? {
+        Value::String(s) => vec![json!({ "type": "message", "role": "user", "content": s })],
+        Value::Array(a) => a.clone(),
+        _ => return None,
+    };
+    items.extend(output.iter().cloned());
+    let instructions = req.get("instructions").and_then(Value::as_str);
+    let mut sample = json!({ "messages": convert::to_chat_messages(instructions, &items, with_reasoning) });
+    let tools = convert::to_chat_tools(req.get("tools").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]));
+    if !tools.is_empty() {
+        sample["tools"] = Value::Array(tools);
     }
     Some(sample)
 }
@@ -228,7 +223,7 @@ fn sft_sample(rec: &Value, tier: &str, with_reasoning: bool) -> Option<Value> {
 mod tests {
     use super::*;
 
-    fn record(tier: &str, finish: &str) -> Value {
+    fn record(tier: &str, status: &str) -> Value {
         json!({
             "tier": tier,
             "classifier": { "state": "hi", "answers": {
@@ -236,17 +231,20 @@ mod tests {
                 "difficulty_score": { "score": 0.3 },
                 "prefer_cheap_model": { "noul": 0.9 }
             }},
-            "request": { "messages": [{ "role": "user", "content": "hi" }], "tools": [] },
+            "request": { "instructions": "sys", "input": "hi", "tools": [] },
             "response": {
-                "message": { "role": "assistant", "content": "hello", "reasoning_content": "think" },
-                "finish_reason": finish, "error": null
+                "status": status, "error": null,
+                "output": [
+                    { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "think" }] },
+                    { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "hello" }] }
+                ]
             }
         })
     }
 
     #[test]
     fn router_sample_has_label() {
-        let s = router_sample(&record("small", "stop")).unwrap();
+        let s = router_sample(&record("small", "completed")).unwrap();
         let label: Value = serde_json::from_str(s.pointer("/messages/2/content").unwrap().as_str().unwrap()).unwrap();
         assert_eq!(label["difficulty_level"], "cheap");
         assert_eq!(label["prefer_cheap_model"], 0.9);
@@ -254,13 +252,15 @@ mod tests {
 
     #[test]
     fn sft_sample_filters_and_strips_reasoning() {
-        assert!(sft_sample(&record("small", "stop"), "frontier", false).is_none());
-        assert!(sft_sample(&record("frontier", "length"), "frontier", false).is_none());
-        let s = sft_sample(&record("frontier", "stop"), "frontier", false).unwrap();
-        assert_eq!(s["messages"][1]["content"], "hello");
-        assert!(s["messages"][1].get("reasoning_content").is_none());
+        assert!(sft_sample(&record("small", "completed"), "frontier", false).is_none());
+        assert!(sft_sample(&record("frontier", "incomplete"), "frontier", false).is_none());
+        let s = sft_sample(&record("frontier", "completed"), "frontier", false).unwrap();
+        assert_eq!(s["messages"][0]["role"], "system");
+        assert_eq!(s["messages"][1]["content"], "hi");
+        assert_eq!(s["messages"][2]["content"], "hello");
+        assert!(s["messages"][2].get("reasoning_content").is_none());
         assert!(s.get("tools").is_none());
-        let s = sft_sample(&record("frontier", "stop"), "frontier", true).unwrap();
-        assert_eq!(s["messages"][1]["reasoning_content"], "think");
+        let s = sft_sample(&record("frontier", "completed"), "frontier", true).unwrap();
+        assert_eq!(s["messages"][2]["reasoning_content"], "think");
     }
 }

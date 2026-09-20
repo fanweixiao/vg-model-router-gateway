@@ -1,539 +1,200 @@
-//! stream=true：把上游 Chat Completions 的 SSE chunk 实时翻译成 Responses API 的 SSE 事件，
-//! 结束时打印 stop 值和 usage（README: Conversion details → Response、Reading the logs）
+//! stream=true：把上游 /v1/responses 的 SSE 原样转发给 codex，只改写 data 里的 model（加 viv- 前缀）；
+//! 同时记下最终的 response 对象，结束时打印 status 和 usage（README: Reading the logs）
 
-use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::time::Instant;
 
-use axum::response::sse::Event;
+use axum::body::Bytes;
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::convert::{
-    convert_usage, map_finish_reason, message_item, new_id, now_secs, reasoning_item, reasoning_text,
-    response_object, tool_call_item,
-};
 use crate::report;
-use crate::trainlog::{self, Pending};
+use crate::trainlog::Pending;
 
-pub type EventTx = mpsc::Sender<Result<Event, Infallible>>;
+pub type ByteTx = mpsc::Sender<Result<Bytes, Infallible>>;
 
-// 输出里的一个 item：文本消息 / 思考内容 / 工具调用
-enum Kind {
-    Message,
-    Reasoning,
-    Tool {
-        call_id: String,
-        name: String,
-        custom: bool,
-        added: bool,
-    },
+// 返回给 codex 的 model-id 都加上这个前缀（README: Model id prefix）
+pub const MODEL_PREFIX: &str = "viv-";
+
+// 给响应对象的 model 加前缀：非流式是顶层 model，流式事件是 response.model。已经带前缀的不重复加。
+// 返回是否改动过
+pub fn add_model_prefix(v: &mut Value) -> bool {
+    fn prefix(m: Option<&mut Value>) -> bool {
+        if let Some(m) = m
+            && let Some(s) = m.as_str()
+            && !s.is_empty()
+            && !s.starts_with(MODEL_PREFIX)
+        {
+            *m = Value::String(format!("{MODEL_PREFIX}{s}"));
+            return true;
+        }
+        false
+    }
+    let top = prefix(v.get_mut("model"));
+    prefix(v.pointer_mut("/response/model")) | top
 }
 
-struct Item {
-    id: String,
-    kind: Kind,
-    // 累积的增量内容（文本 / 思考 / 工具参数）
-    buf: String,
-    // 发出 response.output_item.done 后的最终 item，用于最后的 response 对象
-    done: Option<Value>,
+// 改写一行 SSE：data 行里的 JSON 有 model 要加前缀时才重新序列化，其他行（event: / id: / 空行 / [DONE]
+// / 不带 model 的 delta 事件）原样返回。第二个返回值是解析出的事件（改写前），用来记录最终结果
+fn rewrite_line(line: &str) -> (String, Option<Value>) {
+    let body = line.trim_end_matches(['\r', '\n']);
+    let Some(data) = body.strip_prefix("data:") else {
+        return (line.to_string(), None);
+    };
+    let Ok(event) = serde_json::from_str::<Value>(data.trim_start()) else {
+        return (line.to_string(), None);
+    };
+    let mut out = event.clone();
+    if !add_model_prefix(&mut out) {
+        return (line.to_string(), Some(event));
+    }
+    let eol = &line[body.len()..];
+    (format!("data: {out}{eol}"), Some(event))
 }
 
-// 处理一行 SSE 后的结果：继续 / 收到 [DONE] / 上游报错
-enum Line {
-    Continue,
-    Done,
-    Error(String),
-}
-
-pub struct Translator {
-    tx: EventTx,
-    seq: u64,
+pub struct Relay {
+    tx: ByteTx,
     req_id: u64,
     started: Instant,
-    resp_id: String,
-    created_at: i64,
+    // 请求里的 model（路由后的），上游没给最终 response 时日志里用它
     model: String,
-    custom_tools: HashSet<String>,
-
-    // 输出 item 列表，以及当前正在写入的文本 / 思考 item、工具调用 index → item 的映射
-    items: Vec<Item>,
-    open_text: Option<usize>,
-    open_reasoning: Option<usize>,
-    tool_slots: HashMap<u64, usize>,
-    last_tool: Option<usize>,
-
-    // 以下用于最后的日志：stop 值、usage、是否收到 [DONE]、异常 note
-    finish_reason: Option<String>,
-    extra_stop: Vec<(String, Value)>,
-    usage: Option<Value>,
-    got_done: bool,
-    chunks: u64,
+    // response.completed / incomplete / failed 里的 response 对象（未加前缀）
+    final_resp: Option<Value>,
+    // 上游的 error 事件
+    error: Option<String>,
+    events: u64,
     client_gone: bool,
-    notes: Vec<String>,
-
     // model-router 模式下的训练数据记录，结束时补上完整输出后写入
     pending: Option<Pending>,
 }
 
-impl Translator {
-    pub fn new(
-        tx: EventTx,
-        req_id: u64,
-        started: Instant,
-        model: String,
-        custom_tools: HashSet<String>,
-        pending: Option<Pending>,
-    ) -> Self {
+impl Relay {
+    pub fn new(tx: ByteTx, req_id: u64, started: Instant, model: String, pending: Option<Pending>) -> Self {
         Self {
             tx,
-            seq: 0,
             req_id,
             started,
-            resp_id: new_id("resp"),
-            created_at: now_secs(),
             model,
-            custom_tools,
-            items: Vec::new(),
-            open_text: None,
-            open_reasoning: None,
-            tool_slots: HashMap::new(),
-            last_tool: None,
-            finish_reason: None,
-            extra_stop: Vec::new(),
-            usage: None,
-            got_done: false,
-            chunks: 0,
+            final_resp: None,
+            error: None,
+            events: 0,
             client_gone: false,
-            notes: Vec::new(),
             pending,
         }
     }
 
-    // 主循环：先发 response.created / in_progress，再逐行读上游 SSE，最后 finish
+    // 主循环：按行读上游 SSE，改写后转发；每个网络 chunk 里完整的行攒成一次发送
     pub async fn run(mut self, upstream: reqwest::Response) {
-        let snapshot = response_object(&self.resp_id, self.created_at, &self.model, "in_progress", None, vec![], Value::Null);
-        self.emit("response.created", json!({ "response": snapshot.clone() })).await;
-        self.emit("response.in_progress", json!({ "response": snapshot })).await;
-
         let mut body = upstream.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut error: Option<String> = None;
+        let mut read_error = None;
 
-        'outer: while let Some(chunk) = body.next().await {
+        while let Some(chunk) = body.next().await {
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    error = Some(format!("upstream stream read error: {e}"));
+                    read_error = Some(format!("upstream stream read error: {e}"));
                     break;
                 }
             };
             buf.extend_from_slice(&bytes);
+            let mut out = String::new();
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let raw: Vec<u8> = buf.drain(..=pos).collect();
-                match self.process_line(&String::from_utf8_lossy(&raw)).await {
-                    Line::Continue => {}
-                    Line::Done => break 'outer,
-                    Line::Error(e) => {
-                        error = Some(e);
-                        break 'outer;
-                    }
+                out.push_str(&self.process_line(&String::from_utf8_lossy(&raw)));
+            }
+            if !out.is_empty() && !self.send(out).await {
+                break;
+            }
+        }
+        // 最后一行没有换行符时也转发出去
+        if !buf.is_empty() && !self.client_gone {
+            let out = self.process_line(&String::from_utf8_lossy(&buf));
+            self.send(out).await;
+        }
+        self.finish(read_error);
+    }
+
+    fn process_line(&mut self, line: &str) -> String {
+        let (out, event) = rewrite_line(line);
+        if let Some(ev) = event {
+            self.events += 1;
+            let ty = ev.get("type").and_then(Value::as_str).unwrap_or("");
+            debug!("#{} upstream event: {ty}", self.req_id);
+            match ty {
+                "response.completed" | "response.incomplete" | "response.failed" => {
+                    self.final_resp = ev.get("response").cloned();
                 }
-                if self.client_gone {
-                    break 'outer;
+                "error" => {
+                    self.error = Some(
+                        ev.get("message")
+                            .or_else(|| ev.pointer("/error/message"))
+                            .and_then(Value::as_str)
+                            .map_or_else(|| ev.to_string(), str::to_string),
+                    );
                 }
+                _ => {}
             }
         }
-        // 最后一行可能没有换行符
-        if error.is_none() && !self.got_done && !self.client_gone && !buf.is_empty() {
-            let rest = String::from_utf8_lossy(&buf).to_string();
-            if let Line::Error(e) = self.process_line(&rest).await {
-                error = Some(e);
-            }
-        }
-
-        self.finish(error).await;
+        out
     }
 
-    // 解析一行 "data: ..."：[DONE] / error 事件 / 普通 chunk
-    async fn process_line(&mut self, line: &str) -> Line {
-        let line = line.trim_end_matches(['\r', '\n']);
-        let Some(data) = line.strip_prefix("data:") else {
-            return Line::Continue;
-        };
-        let data = data.trim_start();
-        if data == "[DONE]" {
-            self.got_done = true;
-            return Line::Done;
-        }
-        match serde_json::from_str::<Value>(data) {
-            Ok(v) => {
-                if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-                    return Line::Error(format!("upstream sent error event: {err}"));
-                }
-                self.on_chunk(&v).await;
-            }
-            Err(e) => warn!(req = self.req_id, "unparseable upstream SSE data ({e}): {data}"),
-        }
-        Line::Continue
-    }
-
-    // 处理一个 chunk：记下 usage，把 delta 分发给思考 / 文本 / 工具调用，记录 finish_reason
-    async fn on_chunk(&mut self, v: &Value) {
-        self.chunks += 1;
-        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-            self.usage = Some(u.clone());
-        }
-        if let Some(m) = v.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()) {
-            self.model = m.to_string();
-        }
-        let Some(choices) = v.get("choices").and_then(Value::as_array) else {
-            return;
-        };
-        for choice in choices {
-            if choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
-                continue;
-            }
-            let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if let Some(r) = reasoning_text(delta) {
-                self.on_reasoning(r).await;
-            }
-            if let Some(t) = delta.get("content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                self.on_text(t).await;
-            }
-            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                for tc in tcs {
-                    self.on_tool_delta(tc).await;
-                }
-            }
-            // stop 值：记录 finish_reason；中途变化也记一条 note，方便排查
-            if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
-                debug!(req = self.req_id, chunk = self.chunks, finish_reason = fr, "finish_reason received");
-                if let Some(prev) = &self.finish_reason
-                    && prev != fr
-                {
-                    self.notes.push(format!("finish_reason changed mid-stream: {prev:?} -> {fr:?}"));
-                }
-                self.finish_reason = Some(fr.to_string());
-            }
-            for (k, val) in report::extra_stop_fields(choice) {
-                match self.extra_stop.iter_mut().find(|(ek, _)| *ek == k) {
-                    Some(slot) => slot.1 = val,
-                    None => self.extra_stop.push((k, val)),
-                }
-            }
-        }
-    }
-
-    fn push_item(&mut self, kind: Kind, prefix: &str) -> usize {
-        self.items.push(Item {
-            id: new_id(prefix),
-            kind,
-            buf: String::new(),
-            done: None,
-        });
-        self.items.len() - 1
-    }
-
-    // 思考内容增量 → reasoning item + reasoning_summary_text.delta 事件
-    async fn on_reasoning(&mut self, delta: &str) {
-        let idx = match self.open_reasoning {
-            Some(i) => i,
-            None => {
-                self.close_text().await;
-                let i = self.push_item(Kind::Reasoning, "rs");
-                self.open_reasoning = Some(i);
-                let id = self.items[i].id.clone();
-                self.emit(
-                    "response.output_item.added",
-                    json!({ "output_index": i, "item": { "id": id, "type": "reasoning", "summary": [] } }),
-                )
-                .await;
-                self.emit(
-                    "response.reasoning_summary_part.added",
-                    json!({ "item_id": id, "output_index": i, "summary_index": 0, "part": { "type": "summary_text", "text": "" } }),
-                )
-                .await;
-                i
-            }
-        };
-        self.items[idx].buf.push_str(delta);
-        let id = self.items[idx].id.clone();
-        self.emit(
-            "response.reasoning_summary_text.delta",
-            json!({ "item_id": id, "output_index": idx, "summary_index": 0, "delta": delta }),
-        )
-        .await;
-    }
-
-    // 文本增量 → message item + output_text.delta 事件
-    async fn on_text(&mut self, delta: &str) {
-        let idx = match self.open_text {
-            Some(i) => i,
-            None => {
-                self.close_reasoning().await;
-                let i = self.push_item(Kind::Message, "msg");
-                self.open_text = Some(i);
-                let id = self.items[i].id.clone();
-                self.emit(
-                    "response.output_item.added",
-                    json!({ "output_index": i, "item": {
-                        "id": id, "type": "message", "status": "in_progress", "role": "assistant", "content": []
-                    } }),
-                )
-                .await;
-                self.emit(
-                    "response.content_part.added",
-                    json!({ "item_id": id, "output_index": i, "content_index": 0,
-                            "part": { "type": "output_text", "text": "", "annotations": [] } }),
-                )
-                .await;
-                i
-            }
-        };
-        self.items[idx].buf.push_str(delta);
-        let id = self.items[idx].id.clone();
-        self.emit(
-            "response.output_text.delta",
-            json!({ "item_id": id, "output_index": idx, "content_index": 0, "delta": delta, "logprobs": [] }),
-        )
-        .await;
-    }
-
-    // 工具调用增量：按 index 归到同一个调用，拼接参数；
-    // function 工具发 function_call_arguments.delta，custom 工具等结束时一次性给出 input
-    async fn on_tool_delta(&mut self, tc: &Value) {
-        let key = tc.get("index").and_then(Value::as_u64);
-        let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
-        let name = tc.pointer("/function/name").and_then(Value::as_str).filter(|s| !s.is_empty());
-        let args = tc.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
-
-        let existing = match key {
-            Some(k) => self.tool_slots.get(&k).copied(),
-            None => self.last_tool,
-        };
-        // 同一个 index 沿用同一个调用，除非上游在这个 index 上换了新的 call id
-        let slot = match existing {
-            Some(i) if id.is_none_or(|id| matches!(&self.items[i].kind, Kind::Tool { call_id, .. } if call_id == id)) => i,
-            _ => {
-                self.close_reasoning().await;
-                self.close_text().await;
-                let kind = Kind::Tool {
-                    call_id: id.map(str::to_string).unwrap_or_else(|| new_id("call")),
-                    name: String::new(),
-                    custom: false,
-                    added: false,
-                };
-                let i = self.push_item(kind, "fc");
-                if let Some(k) = key {
-                    self.tool_slots.insert(k, i);
-                }
-                i
-            }
-        };
-        self.last_tool = Some(slot);
-
-        let custom_names = &self.custom_tools;
-        let item = &mut self.items[slot];
-        item.buf.push_str(args);
-        let Kind::Tool { call_id, name: cur_name, custom, added } = &mut item.kind else {
-            return;
-        };
-        if let Some(n) = name
-            && cur_name.is_empty()
-        {
-            *cur_name = n.to_string();
-            *custom = custom_names.contains(n);
-        }
-        let need_added = !*added && !cur_name.is_empty();
-        if need_added {
-            *added = true;
-        }
-        let (item_id, call_id, cur_name, custom, added) =
-            (item.id.clone(), call_id.clone(), cur_name.clone(), *custom, *added);
-
-        if need_added {
-            self.emit_tool_added(slot, &item_id, &call_id, &cur_name, custom).await;
-        }
-        if added && !custom && !args.is_empty() {
-            self.emit(
-                "response.function_call_arguments.delta",
-                json!({ "item_id": item_id, "output_index": slot, "delta": args }),
-            )
-            .await;
-        }
-    }
-
-    async fn emit_tool_added(&mut self, idx: usize, item_id: &str, call_id: &str, name: &str, custom: bool) {
-        let item = if custom {
-            json!({ "id": item_id, "type": "custom_tool_call", "status": "in_progress",
-                    "call_id": call_id, "name": name, "input": "" })
-        } else {
-            json!({ "id": item_id, "type": "function_call", "status": "in_progress",
-                    "call_id": call_id, "name": name, "arguments": "" })
-        };
-        self.emit("response.output_item.added", json!({ "output_index": idx, "item": item })).await;
-    }
-
-    // 以下 close_* 结束对应的 item，发出 *.done 和 output_item.done 事件
-    async fn close_text(&mut self) {
-        let Some(i) = self.open_text.take() else { return };
-        let (id, text) = (self.items[i].id.clone(), self.items[i].buf.clone());
-        self.emit(
-            "response.output_text.done",
-            json!({ "item_id": id, "output_index": i, "content_index": 0, "text": text, "logprobs": [] }),
-        )
-        .await;
-        self.emit(
-            "response.content_part.done",
-            json!({ "item_id": id, "output_index": i, "content_index": 0,
-                    "part": { "type": "output_text", "text": text, "annotations": [] } }),
-        )
-        .await;
-        let item = message_item(&id, &text);
-        self.items[i].done = Some(item.clone());
-        self.emit("response.output_item.done", json!({ "output_index": i, "item": item })).await;
-    }
-
-    async fn close_reasoning(&mut self) {
-        let Some(i) = self.open_reasoning.take() else { return };
-        let (id, text) = (self.items[i].id.clone(), self.items[i].buf.clone());
-        self.emit(
-            "response.reasoning_summary_text.done",
-            json!({ "item_id": id, "output_index": i, "summary_index": 0, "text": text }),
-        )
-        .await;
-        self.emit(
-            "response.reasoning_summary_part.done",
-            json!({ "item_id": id, "output_index": i, "summary_index": 0,
-                    "part": { "type": "summary_text", "text": text } }),
-        )
-        .await;
-        let item = reasoning_item(&id, &text);
-        self.items[i].done = Some(item.clone());
-        self.emit("response.output_item.done", json!({ "output_index": i, "item": item })).await;
-    }
-
-    async fn close_tools(&mut self) {
-        for i in 0..self.items.len() {
-            let it = &self.items[i];
-            let Kind::Tool { call_id, name, custom, added } = &it.kind else { continue };
-            if it.done.is_some() {
-                continue;
-            }
-            let (id, call_id, name, custom, added, args) =
-                (it.id.clone(), call_id.clone(), name.clone(), *custom, *added, it.buf.clone());
-            if name.is_empty() {
-                self.notes.push(format!("tool call {call_id} never received a function name"));
-            }
-            if !added {
-                self.emit_tool_added(i, &id, &call_id, &name, custom).await;
-            }
-            if !custom {
-                self.emit(
-                    "response.function_call_arguments.done",
-                    json!({ "item_id": id, "output_index": i, "arguments": args }),
-                )
-                .await;
-            }
-            let item = tool_call_item(&id, &call_id, &name, &args, custom);
-            self.items[i].done = Some(item.clone());
-            self.emit("response.output_item.done", json!({ "output_index": i, "item": item })).await;
-        }
-    }
-
-    // 结束：关闭所有 item，按 finish_reason 决定发 completed / incomplete / failed，
-    // 然后打印 stop + usage 日志（README: How finish_reason maps to what Codex receives）
-    async fn finish(mut self, mut error: Option<String>) {
-        self.close_reasoning().await;
-        self.close_text().await;
-        self.close_tools().await;
-
-        // 既没 finish_reason 也没 [DONE]：上游中途断了，发 response.failed
-        if error.is_none() && !self.client_gone && !self.got_done && self.finish_reason.is_none() {
-            error = Some("upstream stream ended without finish_reason and without [DONE]".into());
-        }
-        if !self.got_done && !self.client_gone {
-            self.notes.push(format!("upstream stream closed without [DONE] (after {} chunks)", self.chunks));
-        }
-
-        let output: Vec<Value> = self.items.iter().filter_map(|i| i.done.clone()).collect();
-        let usage = convert_usage(self.usage.as_ref());
-
-        let (event, status) = match &error {
-            Some(err) => {
-                self.notes.push(format!("ERROR: {err}"));
-                let mut resp = response_object(&self.resp_id, self.created_at, &self.model, "failed", None, output, usage);
-                resp["error"] = json!({ "code": "upstream_error", "message": err });
-                ("response.failed", resp)
-            }
-            None => {
-                let (status, reason) = map_finish_reason(self.finish_reason.as_deref());
-                let resp = response_object(&self.resp_id, self.created_at, &self.model, status, reason, output, usage);
-                let ev = if status == "incomplete" { "response.incomplete" } else { "response.completed" };
-                (ev, resp)
-            }
-        };
-        let status_str = status["status"].as_str().unwrap_or("?").to_string();
-
-        if self.client_gone {
-            self.notes.push("client disconnected before the response finished".into());
-        } else {
-            self.emit(event, json!({ "response": status })).await;
-        }
-
-        if let Some(p) = self.pending.take() {
-            let err = error.as_deref().or(self.client_gone.then_some("client disconnected"));
-            p.finish(&self.model, self.chat_message(), self.finish_reason.as_deref(), self.usage.as_ref(), err);
-        }
-
-        report::log(&report::Report {
-            req_id: self.req_id,
-            stream: true,
-            elapsed: self.started.elapsed(),
-            model: &self.model,
-            finish_reason: self.finish_reason.as_deref(),
-            extra_stop: &self.extra_stop,
-            status: &format!("{status_str} (sent {event})"),
-            usage: report::Usage::from_chat(self.usage.as_ref()),
-            notes: &self.notes,
-        });
-    }
-
-    // 把流式输出拼回 Chat 格式的 assistant 消息（写训练数据日志用）
-    fn chat_message(&self) -> serde_json::Value {
-        let (mut text, mut reasoning, mut tool_calls) = (String::new(), String::new(), Vec::new());
-        for it in &self.items {
-            match &it.kind {
-                Kind::Message => text.push_str(&it.buf),
-                Kind::Reasoning => reasoning.push_str(&it.buf),
-                Kind::Tool { call_id, name, .. } => tool_calls.push(json!({
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": it.buf },
-                })),
-            }
-        }
-        trainlog::assistant_message(
-            (!text.is_empty()).then_some(text),
-            (!reasoning.is_empty()).then_some(reasoning),
-            tool_calls,
-        )
-    }
-
-    // 发一个 Responses SSE 事件给 codex（带 type 和递增的 sequence_number）
-    async fn emit(&mut self, ty: &str, mut data: Value) {
-        if self.client_gone {
-            return;
-        }
-        data["type"] = json!(ty);
-        data["sequence_number"] = json!(self.seq);
-        self.seq += 1;
-        let ev = Event::default().event(ty).data(data.to_string());
-        if self.tx.send(Ok(ev)).await.is_err() {
+    async fn send(&mut self, out: String) -> bool {
+        if self.tx.send(Ok(Bytes::from(out))).await.is_err() {
             self.client_gone = true;
         }
+        !self.client_gone
+    }
+
+    // 结束：写训练数据日志，打印 status + usage 日志
+    fn finish(mut self, read_error: Option<String>) {
+        let mut notes = Vec::new();
+        let mut error = read_error.or(self.error.take());
+        if self.client_gone {
+            notes.push("client disconnected before the response finished".to_string());
+        } else if self.final_resp.is_none() && error.is_none() {
+            error = Some(format!(
+                "upstream stream ended without response.completed / incomplete / failed (after {} events)",
+                self.events
+            ));
+        }
+        if let Some(e) = &error {
+            notes.push(format!("ERROR: {e}"));
+        }
+
+        let resp = self.final_resp.as_ref();
+        if let Some(p) = self.pending.take() {
+            let err = error.as_deref().or(self.client_gone.then_some("client disconnected"));
+            p.finish(&self.model, resp, err);
+        }
+        report::log(&report::Report::new(self.req_id, true, self.started.elapsed(), &self.model, resp, notes));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn prefix_is_added_once() {
+        let mut v = json!({ "model": "gpt-5", "response": { "model": "viv-gpt-5" } });
+        add_model_prefix(&mut v);
+        assert_eq!(v["model"], "viv-gpt-5");
+        assert_eq!(v["response"]["model"], "viv-gpt-5");
+    }
+
+    #[test]
+    fn rewrite_only_touches_data_lines() {
+        assert_eq!(rewrite_line("event: response.created\n").0, "event: response.created\n");
+        assert_eq!(rewrite_line("data: [DONE]\n").0, "data: [DONE]\n");
+        // 没有 model 的事件原样返回（不重新序列化）
+        let delta = "data:{\"type\": \"response.output_text.delta\", \"delta\": \"1.0e-5\"}\n";
+        assert_eq!(rewrite_line(delta).0, delta);
+        let (out, ev) = rewrite_line("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"m\"}}\r\n");
+        assert_eq!(out, "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"viv-m\"}}\r\n");
+        assert_eq!(ev.unwrap()["response"]["model"], "m");
     }
 }
